@@ -12,6 +12,9 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_metal.h>
 #include <stdatomic.h>
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "nvn.h"
 #include "renderer.h"
@@ -209,6 +212,63 @@ static void dump_largest_textures(const char *why) {
 
 static uint64_t frames, total_frames;
 uint64_t renderer_present_count(void) { return total_frames; }
+
+// Hang watchdog: the game presents a frame every ~16 ms. If no frame is presented for
+// LARECOMP_HANG_SECONDS (default 15) while guest threads are alive, write a thread dump
+// (PCs, wait objects, backtraces) to LARECOMP_HANG_LOG (a directory, or a file path) or to
+// hang-<date>.log in the working directory. LARECOMP_HANG_ABORT=1 exits afterwards.
+// One report per stall; re-armed when frames resume. LARECOMP_HANG_SECONDS=0 disables it.
+void kernel_dump_threads_to(FILE *f);
+int kernel_live_threads(void);
+
+static void *hang_watchdog(void *arg) {
+    (void)arg;
+    const char *secs = getenv("LARECOMP_HANG_SECONDS");
+    long limit = secs && *secs ? atol(secs) : 15;
+    if (limit <= 0) return NULL;
+    const char *ab = getenv("LARECOMP_HANG_ABORT");
+    const int do_abort = ab && *ab && strcmp(ab, "0") != 0;
+    uint64_t last = 0, since = 0;
+    int reported = 0;
+    for (;;) {
+        struct timespec ts = {1, 0};
+        nanosleep(&ts, NULL);
+        uint64_t f = __atomic_load_n(&total_frames, __ATOMIC_RELAXED);
+        time_t t = time(NULL);
+        uint64_t now = (uint64_t)t;
+        if (f != last) { last = f; since = now; reported = 0; continue; }
+        if (f == 0 || since == 0 || now - since < (uint64_t)limit) continue;
+        if (kernel_live_threads() == 0) { since = now; reported = 0; continue; }
+        if (reported) continue;
+        reported = 1;
+        char path[1024], stamp[32];
+        struct tm tm;
+        localtime_r(&t, &tm);
+        strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tm);
+        const char *dest = getenv("LARECOMP_HANG_LOG");
+        struct stat st;
+        if (dest && *dest) {
+            if (stat(dest, &st) == 0 && S_ISDIR(st.st_mode))
+                snprintf(path, sizeof path, "%s/hang-%s.log", dest, stamp);
+            else
+                snprintf(path, sizeof path, "%s", dest);
+        } else {
+            snprintf(path, sizeof path, "hang-%s.log", stamp);
+        }
+        FILE *fp = fopen(path, "w");
+        if (!fp) {
+            LOG("[hang] no frame for %llu s; cannot write %s\n", (unsigned long long)(now - since), path);
+            continue;
+        }
+        fprintf(fp, "[hang] no frame presented for %llu s (frames=%llu, pid=%d, %s)\n",
+                (unsigned long long)(now - since), (unsigned long long)f, (int)getpid(), stamp);
+        kernel_dump_threads_to(fp);
+        fclose(fp);
+        LOG("[hang] no frame for %llu s; report: %s\n", (unsigned long long)(now - since), path);
+        if (do_abort) _exit(3);
+    }
+    return NULL;
+}
 
 // Output resolution: render targets the game sizes for the 1920x1080 screen are allocated at
 // (sx, sy) times their guest size. Shaders and the renderer keep working in guest ("logical") units.
@@ -1165,6 +1225,14 @@ void *ui_metal_layer(void) { return (__bridge void *)layer; }
 void *ui_metal_device(void) { return (__bridge void *)dev; }
 
 int ui_run(void) {
+    {   // hang watchdog (see above): reports a game that stops presenting frames
+        static bool started;
+        if (!started) {
+            started = true;
+            pthread_t th;
+            if (pthread_create(&th, NULL, hang_watchdog, NULL) == 0) pthread_detach(th);
+        }
+    }
     // The emulated vsync/timer threads need precise sleeps; App Nap timer coalescing
     // otherwise stretches 16ms sleeps to ~100ms whenever the window isn't frontmost.
     static id activity;

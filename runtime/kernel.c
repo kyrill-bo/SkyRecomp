@@ -924,52 +924,67 @@ KSharedMem *kernel_create_shared_memory(uint64_t size, void (*on_map)(KSharedMem
     return s;
 }
 
-void kernel_dump_threads(void) {
+void kernel_dump_threads_to(FILE *f) {
+#define LOGF(...) fprintf(f, __VA_ARGS__)
     pthread_mutex_lock(&g_klock);
-    LOG("=== [threads dump] ===\n");
+    LOGF("=== [threads dump] ===\n");
     for (KThread *t = g_threads; t; t = t->anext) {
         if (!t->started || t->finished) continue;
         uint64_t off = 0;
         const char *sym_pc = loader_symbol_at(t->cpu.pc, &off);
         uint64_t off_lr = 0;
         const char *sym_lr = loader_symbol_at(t->cpu.x[30], &off_lr);
-        LOG("  thr handle=%x id=%llu prio=%d pc=%llx (%s+%llx) lr=%llx (%s+%llx) wait=%d sync=%d addr=%llx\n",
+        LOGF("  thr handle=%x id=%llu prio=%d pc=%llx (%s+%llx) lr=%llx (%s+%llx) wait=%d sync=%d addr=%llx\n",
             t->handle, (unsigned long long)t->id, t->prio,
             (unsigned long long)t->cpu.pc, sym_pc ? sym_pc : "?", (unsigned long long)off,
             (unsigned long long)t->cpu.x[30], sym_lr ? sym_lr : "?", (unsigned long long)off_lr,
             t->wait_kind, t->in_sync_wait, (unsigned long long)t->wait_addr);
         uint64_t fp = t->cpu.x[29];
-        LOG("    bt:");
+        LOGF("    bt:");
         for (int depth = 0; depth < 10 && fp >= 0x7100000000ull && fp < 0x7300000000ull && (fp & 7) == 0; depth++) {
             uint64_t next_fp = *(uint64_t *)(uintptr_t)fp;
             uint64_t ret_addr = *(uint64_t *)(uintptr_t)(fp + 8);
             if (!ret_addr) break;
             uint64_t roff = 0;
             const char *rsym = loader_symbol_at(ret_addr, &roff);
-            LOG(" -> %llx(%s+%llx)", (unsigned long long)ret_addr, rsym ? rsym : "?", (unsigned long long)roff);
+            LOGF(" -> %llx(%s+%llx)", (unsigned long long)ret_addr, rsym ? rsym : "?", (unsigned long long)roff);
             if (next_fp <= fp) break;
             fp = next_fp;
         }
-        LOG("\n");
+        LOGF("\n");
         if (t->in_sync_wait && t->wait_addr && t->wait_tag > 0 && t->wait_tag <= 16) {
             uint32_t *hs = (uint32_t *)(uintptr_t)t->wait_addr;
-            LOG("    sync handles (%u):", t->wait_tag);
+            LOGF("    sync handles (%u):", t->wait_tag);
             for (uint32_t i = 0; i < t->wait_tag; i++) {
                 KObject *o = handle_get(hs[i]);
-                LOG(" %x(type=%d,sig=%d)", hs[i], o ? o->type : -1, o ? o->signaled : -1);
+                LOGF(" %x(type=%d,sig=%d)", hs[i], o ? o->type : -1, o ? o->signaled : -1);
             }
-            LOG("\n");
+            LOGF("\n");
         } else if (t->wait_kind == WAIT_MUTEX && t->wait_addr) {
             uint32_t mv = *u32p(t->wait_addr);
-            LOG("    mutex word at %llx = %#x (owner=%#x)\n", (unsigned long long)t->wait_addr, mv, mv & ~WAITERS_BIT);
+            LOGF("    mutex word at %llx = %#x (owner=%#x)\n", (unsigned long long)t->wait_addr, mv, mv & ~WAITERS_BIT);
         } else if (t->wait_kind == WAIT_CONDVAR && t->wait_addr) {
             uint32_t mv = t->wait_mutex ? *u32p(t->wait_mutex) : 0;
-            LOG("    condvar=%llx mutex=%llx (word=%#x)\n", (unsigned long long)t->wait_addr, (unsigned long long)t->wait_mutex, mv);
+            LOGF("    condvar=%llx mutex=%llx (word=%#x)\n", (unsigned long long)t->wait_addr, (unsigned long long)t->wait_mutex, mv);
         } else if (t->wait_kind == WAIT_ARBITER && t->wait_addr) {
             uint32_t av = *u32p(t->wait_addr);
-            LOG("    arbiter word at %llx = %#x\n", (unsigned long long)t->wait_addr, av);
+            LOGF("    arbiter word at %llx = %#x\n", (unsigned long long)t->wait_addr, av);
         }
     }
     pthread_mutex_unlock(&g_klock);
+}
+#undef LOGF
+
+void kernel_dump_threads(void) { kernel_dump_threads_to(stderr); }
+
+// Live guest threads (0: none; -1: the kernel lock is held right now). The hang watchdog uses this
+// to tell the start screen (no threads) from a game that stopped presenting frames.
+int kernel_live_threads(void) {
+    if (pthread_mutex_trylock(&g_klock)) return -1;
+    int n = 0;
+    for (KThread *t = g_threads; t; t = t->anext)
+        if (t->started && !t->finished) n++;
+    pthread_mutex_unlock(&g_klock);
+    return n;
 }
 
