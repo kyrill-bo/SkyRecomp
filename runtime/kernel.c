@@ -504,6 +504,7 @@ static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, in
                 plat_print_backtrace();
             }
     }
+    int stuck_iters = 0;
     for (;;) {
         for (int i = 0; i < count; i++) {
             KObject *o = handle_get(hs[i]);
@@ -518,7 +519,25 @@ static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, in
         t->wait_tag = (uint32_t)count;
         t->snext = g_syncwaiters;
         g_syncwaiters = t;
-        bool ok = kwait(timeout < 0 ? -1 : timeout, &ts);
+        // (debug, LARECOMP_WAIT_BT=1) who's stuck in an infinite wait, and on what - purely diagnostic, no
+        // effect on timing or behaviour otherwise.
+        bool infinite = timeout < 0;
+        bool dbg = infinite && ENV("LARECOMP_WAIT_BT");
+        bool ok = kwait(dbg ? 3000000000ll : (infinite ? -1 : timeout), &ts);
+        if (dbg && !ok) {
+            stuck_iters++;
+            if (stuck_iters <= 20) {
+                LOG("[wait-bt] thread %p still waiting (%d handles, lr %llx):\n", (void *)t, count,
+                    (unsigned long long)t->cpu.x[30]);
+                for (int i = 0; i < count; i++) {
+                    KObject *o = handle_get(hs[i]);
+                    LOG("  handle %#x -> %p type=%d signaled=%d\n", hs[i], (void *)o, o ? o->type : -1,
+                        o ? o->signaled : -1);
+                }
+                plat_print_backtrace();
+            }
+            continue;
+        }
         for (KThread **p = &g_syncwaiters; *p; p = &(*p)->snext)
             if (*p == t) { *p = t->snext; break; }
         t->in_sync_wait = false;
